@@ -5,6 +5,8 @@
  * Safe to call multiple times — a kv flag prevents re-running.
  */
 
+import fs from 'fs';
+import path from 'path';
 import type { Database } from 'sql.js';
 import type { CronJobService } from './cronJobService';
 import type { Schedule, ScheduledTaskDelivery, ScheduledTaskInput } from '../../renderer/types/scheduledTask';
@@ -181,4 +183,173 @@ export async function migrateScheduledTasksToOpenclaw(deps: MigrationDeps): Prom
   if (gatewayErrors === 0) {
     setKv(MIGRATION_KEY, 'true');
   }
+}
+
+// ---------------------------------------------------------------------------
+// Run history migration: SQLite scheduled_task_runs → OpenClaw JSONL files
+// ---------------------------------------------------------------------------
+
+const RUN_HISTORY_MIGRATION_KEY = 'scheduled_task_runs_migrated_to_openclaw_v1';
+
+interface LegacyRunRow {
+  id: string;
+  task_id: string;
+  session_id: string | null;
+  status: string; // 'success' | 'error' | 'running'
+  started_at: string; // ISO string
+  finished_at: string | null; // ISO string
+  duration_ms: number | null;
+  error: string | null;
+}
+
+/** Convert legacy run status to OpenClaw gateway status. */
+function toGatewayStatus(status: string): 'ok' | 'error' | 'skipped' {
+  if (status === 'success') return 'ok';
+  if (status === 'error') return 'error';
+  return 'skipped';
+}
+
+interface RunHistoryMigrationDeps {
+  db: Database;
+  getKv: (key: string) => unknown;
+  setKv: (key: string, value: string) => void;
+  /** Path to {userData}/openclaw/state — used to locate cron/runs/. */
+  openclawStateDir: string;
+}
+
+export async function migrateScheduledTaskRunsToOpenclaw(
+  deps: RunHistoryMigrationDeps,
+): Promise<void> {
+  const { db, getKv, setKv, openclawStateDir } = deps;
+
+  // 1. Idempotency guard
+  if (getKv(RUN_HISTORY_MIGRATION_KEY) === 'true') return;
+
+  // 2. Check legacy table exists
+  try {
+    const tableCheck = db.exec(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='scheduled_task_runs'",
+    );
+    if (!tableCheck[0]?.values?.length) {
+      setKv(RUN_HISTORY_MIGRATION_KEY, 'true');
+      return;
+    }
+  } catch (err) {
+    console.warn('[MigrateRunHistory] Could not check legacy tables, skipping:', err);
+    return;
+  }
+
+  // 3. Read legacy run rows (use old task_id directly as the JSONL filename)
+  let runs: LegacyRunRow[] = [];
+  try {
+    const result = db.exec(
+      'SELECT id, task_id, session_id, status, started_at, finished_at, duration_ms, error FROM scheduled_task_runs ORDER BY started_at ASC',
+    );
+    if (!result[0]?.values?.length) {
+      setKv(RUN_HISTORY_MIGRATION_KEY, 'true');
+      return;
+    }
+    const cols = result[0].columns;
+    runs = result[0].values.map((vals) => {
+      const obj: Record<string, unknown> = {};
+      cols.forEach((col, i) => { obj[col] = vals[i]; });
+      return obj as unknown as LegacyRunRow;
+    });
+  } catch (err) {
+    console.warn('[MigrateRunHistory] Failed to read legacy runs:', err);
+    return;
+  }
+
+  // 3b. Build taskId → name map for display titles
+  const taskIdToName = new Map<string, string>();
+  try {
+    const taskResult = db.exec('SELECT id, name FROM scheduled_tasks');
+    if (taskResult[0]?.values) {
+      const cols = taskResult[0].columns;
+      for (const vals of taskResult[0].values) {
+        const row: Record<string, unknown> = {};
+        cols.forEach((col, i) => { row[col] = vals[i]; });
+        if (row['id'] && row['name']) {
+          taskIdToName.set(row['id'] as string, row['name'] as string);
+        }
+      }
+    }
+  } catch {
+    // Non-fatal: names will be omitted if the table is unavailable
+  }
+
+  console.log(`[MigrateRunHistory] Migrating ${runs.length} run(s) to OpenClaw cron/runs/...`);
+
+  // 4. Ensure runs directory exists
+  const runsDir = path.join(openclawStateDir, 'cron', 'runs');
+  try {
+    fs.mkdirSync(runsDir, { recursive: true });
+  } catch (err) {
+    console.warn('[MigrateRunHistory] Failed to create runs directory:', err);
+    return;
+  }
+
+  let succeeded = 0;
+  let skipped = 0;
+
+  // 5. Group runs by task_id (used as-is for the JSONL filename)
+  const runsByTaskId = new Map<string, LegacyRunRow[]>();
+  for (const run of runs) {
+    let arr = runsByTaskId.get(run.task_id);
+    if (!arr) { arr = []; runsByTaskId.set(run.task_id, arr); }
+    arr.push(run);
+  }
+
+  for (const [taskId, taskRuns] of runsByTaskId.entries()) {
+    const jsonlPath = path.join(runsDir, `${taskId}.jsonl`);
+
+    // Collect existing timestamps to avoid duplicates on re-run
+    const existingTs = new Set<number>();
+    try {
+      const existing = fs.readFileSync(jsonlPath, 'utf-8');
+      for (const line of existing.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const entry = JSON.parse(trimmed) as { ts?: number };
+          if (typeof entry.ts === 'number') existingTs.add(entry.ts);
+        } catch { /* ignore malformed lines */ }
+      }
+    } catch { /* file doesn't exist yet — that's fine */ }
+
+    const lines: string[] = [];
+    for (const run of taskRuns) {
+      const startedMs = new Date(run.started_at).getTime();
+      const finishedMs = run.finished_at ? new Date(run.finished_at).getTime() : startedMs;
+
+      if (existingTs.has(finishedMs)) { skipped++; continue; }
+
+      const entry: Record<string, unknown> = {
+        ts: finishedMs,
+        jobId: taskId,
+        action: 'finished',
+        status: toGatewayStatus(run.status),
+        runAtMs: startedMs,
+      };
+      if (typeof run.duration_ms === 'number') entry['durationMs'] = run.duration_ms;
+      if (run.error) entry['error'] = run.error;
+      if (run.session_id) entry['sessionId'] = run.session_id;
+      const jobName = taskIdToName.get(taskId);
+      if (jobName) entry['summary'] = jobName;
+
+      lines.push(JSON.stringify(entry));
+      succeeded++;
+    }
+
+    if (lines.length > 0) {
+      try {
+        fs.appendFileSync(jsonlPath, lines.join('\n') + '\n', 'utf-8');
+      } catch (err) {
+        console.error(`[MigrateRunHistory] Failed to write runs for task ${taskId}:`, err);
+      }
+    }
+  }
+
+  console.log(`[MigrateRunHistory] Done. succeeded=${succeeded}, skipped=${skipped}`);
+  setKv(RUN_HISTORY_MIGRATION_KEY, 'true');
 }
