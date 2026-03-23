@@ -126,7 +126,7 @@ const UserMenu: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   const hasCredits = creditItems.length > 0;
 
   return (
-    <div className="absolute bottom-full left-0 mb-1 w-60 dark:bg-claude-darkSurface bg-claude-surface rounded-xl shadow-popover border dark:border-claude-darkBorder border-claude-border overflow-hidden z-50 popover-enter">
+    <div className="absolute bottom-full left-[-0.5rem] mb-1 w-[14.5rem] dark:bg-claude-darkSurface bg-claude-surface rounded-xl shadow-popover border dark:border-claude-darkBorder border-claude-border overflow-hidden z-50 popover-enter">
       {/* Account info */}
       <div className="px-4 py-3 border-b dark:border-claude-darkBorder border-claude-border">
         <div className="text-sm font-medium dark:text-claude-darkText text-claude-text truncate">
